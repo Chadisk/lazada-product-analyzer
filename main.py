@@ -61,8 +61,11 @@ def get_search_text():
     raise SystemExit('ไม่พบคำค้นหา: โปรดส่ง --query "คำค้น" หรือพิมพ์ในคอนโซล')
 
 search_text = get_search_text()
-pages = max(1, int(args.pages))
-print(f"[INFO] จะค้นหา: {search_text} | หน้าที่ดึง: {pages}")
+target = int(input("กี่ข้อมูล : "))
+# ประมาณการ ~40 การ์ด/หน้า แล้วเคารพ --pages ที่อาจส่งมา
+auto_pages = max(1, (target + 39) // 40)  # ceil(target/40)
+pages = max(auto_pages, int(args.pages))
+print(f"[INFO] จะค้นหา: {search_text} | หน้าที่ดึง: {pages} | เป้าหมาย {target} ชิ้น")
 
 # ==========================
 # WebDriver (ลด log กวนตา)
@@ -100,11 +103,21 @@ try:
     except Exception:
         search_box.send_keys(Keys.ENTER)
 
-    wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.buTCk")))
+    # รอให้มีการ์ด (จะรอแบบ union ได้ ไม่กระทบการนับ)
+    wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.buTCk, div[data-qa-locator='product-item']")))
     print("On product search")
 except Exception as e:
     driver.quit()
     raise SystemExit(f"Error details (search): {e}")
+
+# ==========================
+# Card picker (แก้ปัญหานับซ้ำ)
+# ==========================
+def pick_cards(soup):
+    cards = soup.select('div[data-qa-locator="product-item"]')
+    if not cards:
+        cards = soup.select('div.buTCk')
+    return cards
 
 # ==========================
 # Pagination helper
@@ -127,6 +140,7 @@ def click_next_or_stop(driver, timeout=15) -> bool:
         'li.ant-pagination-next:not(.ant-pagination-disabled) a',
         'button[aria-label="Next Page"]',
         'li[title="Next Page"] button',
+        'a.ant-pagination-item-link[aria-label="Next Page"]',
     ]
     next_el = None
     for sel in selectors:
@@ -153,24 +167,53 @@ def click_next_or_stop(driver, timeout=15) -> bool:
 
     # รอการ์ดสินค้าโผล่ (หน้าถัดไป)
     try:
-        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.buTCk")))
+        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.buTCk, div[data-qa-locator='product-item']")))
     except Exception:
         pass
     return True
 
 # ==========================
+# Scroll helper (โหลดการ์ดให้ครบก่อนอ่าน HTML)
+# ==========================
+def lazy_scroll_until_stable(max_rounds=12, patience=3):
+    """
+    เลื่อนลงเป็นช่วง ๆ จนจำนวนการ์ดไม่เพิ่มต่อเนื่อง 'patience' ครั้ง หรือครบ max_rounds
+    """
+    last_count = 0
+    stable_ticks = 0
+    for _ in range(max_rounds):
+        driver.execute_script("window.scrollBy(0, document.body.scrollHeight*0.6);")
+        time.sleep(0.7)
+        sp = BeautifulSoup(driver.page_source, "html.parser")
+        cur = len(pick_cards(sp))
+        if cur <= last_count:
+            stable_ticks += 1
+        else:
+            stable_ticks = 0
+            last_count = cur
+        if stable_ticks >= patience:
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(0.5)
+            break
+
+# ==========================
 # Scrape loop
 # ==========================
 all_inform = []
+seen_urls = set()  # กันซ้ำเบา ๆ ด้วย URL (ไม่เขียนลง CSV)
 
 for page_i in range(1, pages + 1):
     print(f"Start scraping page {page_i}")
     time.sleep(1.0)
 
+    # เลื่อนให้โหลดการ์ดครบก่อน
+    lazy_scroll_until_stable(max_rounds=12, patience=3)
+
     data = driver.page_source
     soup = BeautifulSoup(data, "html.parser")
 
-    cards = soup.find_all("div", {"class": "buTCk"})
+    # ใช้ fallback ไม่ใช่ union (กันนับซ้ำ)
+    cards = pick_cards(soup)
     print(f"Column product: {len(cards)}")
 
     for p in cards:
@@ -182,6 +225,21 @@ for page_i in range(1, pages + 1):
         is_lazmall = 'No'
         reviews = 0
 
+        # URL เพื่อกันซ้ำ
+        url = None
+        a = p.find("a", href=True)
+        if a and a['href']:
+            href = a['href']
+            if href.startswith("//"):
+                href = "https:" + href
+            elif href.startswith("/"):
+                href = "https://www.lazada.co.th" + href
+            url = href
+        if url and url in seen_urls:
+            continue
+        if url:
+            seen_urls.add(url)
+
         name_el = p.find("div", {"class": "RfADt"})
         if name_el:
             product_name = name_el.get_text(strip=True)
@@ -190,21 +248,19 @@ for page_i in range(1, pages + 1):
         if price_el:
             product_price = price_el.get_text(strip=True)
 
-        sold_el = p.find("span", {"class": "_1cEkb"})
+        sold_el = p.find("span", {"class": "_1cEkb"}) or p.find("span", string=re.compile(r"[Ss]old"))
         product_sold = parse_sold(sold_el.get_text(strip=True) if sold_el else "")
 
         loc_el = p.find("span", {"class": "oa6ri"})
         if loc_el:
             product_location = loc_el.get_text(strip=True)
 
-        # LazMall: เจาะจงเฉพาะ badge class นี้ตามที่ร้องขอ
+        # LazMall badge
         badge_el = p.select_one("i.ic-dynamic-badge-68959")
         is_lazmall = "Yes" if badge_el else "No"
 
         # Reviews
-        rv_el = p.select_one("span.qzqFw")
-        if not rv_el:
-            rv_el = p.find("span", string=re.compile(r"\(\s*\d"))
+        rv_el = p.select_one("span.qzqFw") or p.find("span", string=re.compile(r"\(\s*\d"))
         if rv_el:
             reviews = parse_count(rv_el.get_text(strip=True))
 
@@ -213,7 +269,15 @@ for page_i in range(1, pages + 1):
             product_location, is_lazmall, reviews
         ])
 
-    # ไปหน้าถัดไป ถ้ายังไม่ครบจำนวน
+        # หยุดเมื่อครบเป้า
+        if len(all_inform) >= target:
+            break
+
+    # ออกจาก loop หน้านี้ถ้าครบเป้าแล้ว
+    if len(all_inform) >= target:
+        break
+
+    # ไปหน้าถัดไป
     if page_i < pages:
         if not click_next_or_stop(driver):
             break
