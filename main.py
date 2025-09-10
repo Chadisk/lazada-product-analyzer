@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -9,9 +10,17 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
 import argparse, sys, time, os, re
+import requests  # ใช้เรียก Function URL + PUT presigned URL
 import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime
+
+# ============ CONFIG: ไม่พึ่ง ENV ============
+# ใส่ Function URL ของคุณ (เปลี่ยนได้ตามจริง)
+FUNC_URL = "https://hg25srup3ajkv4oor7loiefagy0kelyx.lambda-url.us-east-1.on.aws/"
+# ถ้า Lambda ตั้ง SHARED_SECRET ไว้ ให้กรอกตรงนี้ (ไม่ตั้งก็ปล่อยว่าง "")
+FUNC_SECRET = ""  # เช่น "my-secret-123"
+# ============================================
 
 # ==========================
 # Helpers: parsing functions
@@ -46,6 +55,11 @@ def parse_sold(text: str) -> int:
 parser = argparse.ArgumentParser(description="Lazada scraper")
 parser.add_argument("--query", "-q", type=str, help="คำค้นหาสินค้า")
 parser.add_argument("--pages", "-p", type=int, default=2, help="จำนวนหน้าที่จะดึง (ค่าเริ่มต้น 2)")
+
+# ทางเลือก: ยังอนุญาต override ค่าในโค้ดได้ผ่าน args (ไม่จำเป็นต้องใส่)
+parser.add_argument("--func-url", type=str, help="(override) Lambda Function URL")
+parser.add_argument("--secret", type=str, help="(override) shared secret ถ้ามี")
+parser.add_argument("--remote-filename", type=str, help="ชื่อไฟล์ปลายทางใน S3 (ถ้าไม่ใส่จะใช้ชื่อไฟล์ CSV เดิม)")
 args = parser.parse_args()
 
 def get_search_text():
@@ -62,8 +76,7 @@ def get_search_text():
 
 search_text = get_search_text()
 target = int(input("กี่ข้อมูล : "))
-# ประมาณการ ~40 การ์ด/หน้า แล้วเคารพ --pages ที่อาจส่งมา
-auto_pages = max(1, (target + 39) // 40)  # ceil(target/40)
+auto_pages = max(1, (target + 39) // 40)   # โดยประมาณ ~40 ต่อหน้า
 pages = max(auto_pages, int(args.pages))
 print(f"[INFO] จะค้นหา: {search_text} | หน้าที่ดึง: {pages} | เป้าหมาย {target} ชิ้น")
 
@@ -103,7 +116,7 @@ try:
     except Exception:
         search_box.send_keys(Keys.ENTER)
 
-    # รอให้มีการ์ด (จะรอแบบ union ได้ ไม่กระทบการนับ)
+    # รอการ์ดสินค้า (ใช้ union เพื่อ "รอ" ไม่ใช่เพื่อ "นับ")
     wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.buTCk, div[data-qa-locator='product-item']")))
     print("On product search")
 except Exception as e:
@@ -111,7 +124,7 @@ except Exception as e:
     raise SystemExit(f"Error details (search): {e}")
 
 # ==========================
-# Card picker (แก้ปัญหานับซ้ำ)
+# Card picker (กันนับซ้ำ)
 # ==========================
 def pick_cards(soup):
     cards = soup.select('div[data-qa-locator="product-item"]')
@@ -295,6 +308,45 @@ timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 filename = f"lazadareport_{timestamp}.csv"
 df.to_csv(filename, index=False, encoding="utf-8-sig")
 print(f"Create CSV file successfully: {os.path.abspath(filename)}")
+
+# ==========================
+# Upload to S3 via Function URL (no-env)
+# ==========================
+def upload_via_funcurl(local_path, func_url, secret=None, remote_filename=None, timeout=600):
+    headers = {}
+    if secret:
+        headers["x-api-key"] = secret  # ต้องตรงกับ SHARED_SECRET ของ Lambda (ถ้ามี)
+
+    params = {}
+    if remote_filename:
+        params["filename"] = remote_filename
+
+    # 1) ขอ presigned URL จาก Lambda
+    r = requests.get(func_url, params=params, headers=headers, timeout=30)
+    r.raise_for_status()
+    info = r.json()
+
+    # 2) PUT ไฟล์ขึ้น S3 ตาม presigned URL
+    put_headers = info.get("required_headers", {})
+    put_headers.setdefault("Content-Type", "text/csv")
+
+    with open(local_path, "rb") as f:
+        p = requests.put(info["upload_url"], data=f, headers=put_headers, timeout=timeout)
+        p.raise_for_status()
+
+    print(f"[S3] Uploaded: {info.get('s3_uri')}")
+
+try:
+    # ใช้ค่าที่ฝังไว้ (อนุญาตให้ override ด้วย args หากต้องการ)
+    func_url = (args.func_url or FUNC_URL).strip() if (args.func_url or FUNC_URL) else ""
+    secret = (args.secret or FUNC_SECRET).strip()
+    if func_url:
+        remote_name = args.remote_filename or os.path.basename(filename)
+        upload_via_funcurl(filename, func_url, secret=secret, remote_filename=remote_name)
+    else:
+        print("[S3] ไม่ได้ตั้ง Function URL (ข้ามการอัปโหลด)")
+except Exception as e:
+    print(f"[S3] Upload failed: {e}")
 
 # ปิดเบราว์เซอร์ถ้าไม่ต้องดูต่อ
 # driver.quit()
