@@ -1,12 +1,49 @@
-import os
-import re
-import json
-import argparse
+# -*- coding: utf-8 -*-
+"""
+Analyze Lazada products with Gemini, pulling CSV from S3 via a Lambda Function URL if --csv ไม่ได้ระบุ
+
+ต้องมี:
+  pip install google-generativeai pandas requests
+  # ถ้าใช้ --auth aws-iam (ลงนาม SigV4)
+  pip install boto3 botocore
+"""
+
+import os, re, json, argparse, tempfile, time, random
 from datetime import datetime
 import pandas as pd
-
-# pip install google-generativeai
+import requests
 import google.generativeai as genai
+
+# ============ CONFIG: ไม่พึ่ง ENV ============
+# Function URL ของ PullfromS3 (presigned GET) — ตั้งค่า default ไว้ให้แล้ว
+PULL_FUNC_URL_DEFAULT = "https://ctqsyemagvqh4eqdfd2upg66gy0gsquz.lambda-url.us-east-1.on.aws/"
+PULL_SECRET_DEFAULT   = ""   # ถ้ามี x-api-key ให้ใส่ตรงนี้
+# ============================================
+
+# ============ CONFIG: API KEY (fallback) ============
+API_KEY_DEFAULT = "AIzaSyBaCgYVeTC-r0PzfCd9eNtb6hoK0Wh1ehk"
+# ============================================
+
+# ---------- CLI ----------
+parser = argparse.ArgumentParser(description="Analyze Lazada products with Gemini (pull CSV from S3 via Lambda if needed)")
+# แหล่งข้อมูล
+parser.add_argument("--csv", help="path ไฟล์ CSV ในเครื่อง (ถ้าไม่ใส่ จะพยายามดึงจาก S3 ผ่าน Lambda)")
+parser.add_argument("--pull-url", help="Function URL ของ PullfromS3 (ไม่ใส่จะใช้ค่าจาก CONFIG)", default=None)
+parser.add_argument("--secret", help="x-api-key ถ้า Lambda ตรวจสอบ", default="")
+parser.add_argument("--s3-key", help="ระบุ S3 key ตรง ๆ ที่จะดาวน์โหลด", default="")
+parser.add_argument("--prefix", help="ระบุ prefix (ใช้คู่ --latest เพื่อดึงไฟล์ล่าสุด)", default="")
+parser.add_argument("--latest", action="store_true", help="ใช้ไฟล์ล่าสุดใต้ prefix")
+parser.add_argument("--auth", choices=["none", "aws-iam"], default="none", help="วิธี auth เรียก Function URL (default=none)")
+parser.add_argument("--region", default="us-east-1", help="region สำหรับ aws-iam (ถ้าใช้)")
+parser.add_argument("--debug-pull", action="store_true", help="พิมพ์ response เวลาเรียก Lambda ผิดพลาด")
+
+# วิเคราะห์
+parser.add_argument("--model", default="gemini-1.5-flash", help="ชื่อโมเดล Gemini")
+parser.add_argument("--topn", type=int, default=10, help="จำนวนสินค้าที่ให้โมเดลคัดแนะนำ")
+parser.add_argument("--limit", type=int, default=100, help="จำกัดจำนวนแถวจาก CSV เพื่อลด token")
+parser.add_argument("--debug-raw", action="store_true", help="พิมพ์ผลลัพธ์ดิบของโมเดล (ช่วยดีบัก JSON)")
+args = parser.parse_args()
+
 
 # ---------- Helpers ----------
 def to_number(text):
@@ -18,7 +55,7 @@ def to_number(text):
         return None
     try:
         return float(t)
-    except:
+    except Exception:
         return None
 
 def to_int(text):
@@ -41,33 +78,134 @@ def pick_first_existing(df, candidates):
                 return col
     return None
 
-def json_safely_load(s: str):
+def json_safely_load(s: str) -> dict:
     """
-    พยายามแปลงข้อความเป็น JSON แบบกันพลาด:
-    - ตัดโค้ดบล็อก ``` ออก
-    - หา { ... } ก้อนแรก
+    กันพังเวลารับ JSON จากโมเดล:
+    - ตัด ``` ออก
+    - ดึงก้อน {..} หรือ [..]
+    - แก้ True/False/None -> JSON, ลบ trailing comma, แปลง single quotes -> double quotes
     """
     txt = s.strip()
     if txt.startswith("```"):
-        # ลบ backticks และบรรทัด ```json
         lines = [ln for ln in txt.splitlines() if not ln.strip().startswith("```")]
         txt = "\n".join(lines).strip()
-    start = txt.find("{")
-    end = txt.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        txt = txt[start:end+1]
+
+    start_obj, end_obj = txt.find("{"), txt.rfind("}")
+    start_arr, end_arr = txt.find("["), txt.rfind("]")
+    if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
+        txt = txt[start_obj:end_obj+1]
+    elif start_arr != -1 and end_arr != -1 and end_arr > start_arr:
+        txt = txt[start_arr:end_arr+1]
+
+    txt = re.sub(r'\bTrue\b', 'true', txt)
+    txt = re.sub(r'\bFalse\b', 'false', txt)
+    txt = re.sub(r'\bNone\b', 'null', txt)
+    txt = re.sub(r',\s*([}\]])', r'\1', txt)
+    txt = re.sub(r"(?P<pre>[{,\s])'(?P<key>[^'\\]+)'\s*:", r'\g<pre>"\g<key>":', txt)
+    txt = re.sub(r":\s*'([^'\\]*)'", r': "\1"', txt)
     return json.loads(txt)
 
-# ---------- CLI ----------
-parser = argparse.ArgumentParser(description="Analyze Lazada products with Gemini API")
-parser.add_argument("--csv", required=True, help="path ไฟล์ CSV สินค้า")
-parser.add_argument("--model", default="gemini-1.5-flash", help="ชื่อโมเดล (เช่น gemini-1.5-flash / gemini-1.5-pro)")
-parser.add_argument("--topn", type=int, default=10, help="จำนวนสินค้าสูงสุดที่ให้โมเดลคัดแนะนำ")
-parser.add_argument("--limit", type=int, default=100, help="จำกัดจำนวนแถวจาก CSV เพื่อลด token")
-args = parser.parse_args()
+
+# ---------- Auth helpers (สำหรับ --auth aws-iam) ----------
+def signed_get(url: str, region="us-east-1", service="lambda"):
+    import boto3
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+
+    session = boto3.Session()
+    creds = session.get_credentials().get_frozen_credentials()
+    req = AWSRequest(method="GET", url=url)
+    SigV4Auth(creds, service, region).add_auth(req)
+    prepared = req.prepare()
+    return requests.get(url, headers=dict(prepared.headers), timeout=30)
+
+def http_get(url: str, headers=None, auth_mode="none", region="us-east-1"):
+    headers = headers or {}
+    if auth_mode == "aws-iam":
+        r = signed_get(url, region=region)
+    else:
+        r = requests.get(url, headers=headers, timeout=30)
+    return r
+
+
+# ---------- Pull via Lambda Function URL ----------
+def pull_csv_via_lambda(func_url: str, secret: str = "", s3_key: str = "", prefix: str = "", latest: bool = False,
+                        auth_mode: str = "none", region: str = "us-east-1", debug: bool = False,
+                        retries: int = 3, backoff_base: float = 0.8) -> str:
+    """
+    1) เรียก Function URL ของ PullfromS3 (GET) เพื่อขอ presigned GET URL
+    2) ดาวน์โหลด CSV ลง temp แล้วคืน path
+    - รองรับ auth NONE และ AWS_IAM
+    - รีทรี 5xx ชั่วคราว
+    """
+    headers = {}
+    if secret:
+        headers["x-api-key"] = secret
+
+    # compose query
+    from urllib.parse import urlencode
+    params = {}
+    if s3_key:
+        params["key"] = s3_key
+    if prefix:
+        params["prefix"] = prefix
+    if latest:
+        params["latest"] = "true"
+
+    url = func_url.rstrip("/") + ("/?" + urlencode(params) if params else "/")
+
+    # request → with retry for 5xx
+    for attempt in range(1, retries + 1):
+        r = http_get(url, headers=headers, auth_mode=auth_mode, region=region)
+        if debug and not r.ok:
+            print(f"[PULL][HTTP {r.status_code}] URL={r.url}\nBody: {r.text}")
+        if 500 <= r.status_code < 600 and attempt < retries:
+            # backoff
+            sleep = backoff_base * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
+            time.sleep(sleep)
+            continue
+        r.raise_for_status()
+        info = r.json()
+        break
+
+    download_url = info["download_url"]
+
+    # download (retry 5xx)
+    for attempt in range(1, retries + 1):
+        g = requests.get(download_url, stream=True, timeout=120)
+        if debug and not g.ok:
+            print(f"[GET][HTTP {g.status_code}] URL={download_url}\nBody: {getattr(g, 'text', '')[:500]}")
+        if 500 <= g.status_code < 600 and attempt < retries:
+            sleep = backoff_base * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
+            time.sleep(sleep)
+            continue
+        g.raise_for_status()
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        for chunk in g.iter_content(chunk_size=1024 * 128):
+            if chunk:
+                tmp.write(chunk)
+        tmp.flush(); tmp.close()
+        print(f"[PULL] Downloaded from S3 to local: {tmp.name}")
+        return tmp.name
+
+    raise RuntimeError("unexpected: download loop exited without return")
+
+
+# ---------- เลือกแหล่ง CSV ----------
+csv_path = args.csv
+if not csv_path:
+    func_url = (args.pull_url or PULL_FUNC_URL_DEFAULT).strip()
+    secret   = (args.secret   or PULL_SECRET_DEFAULT).strip()
+    if not func_url:
+        raise SystemExit("ไม่ระบุ --csv และไม่มี --pull-url/PULL_FUNC_URL_DEFAULT ให้ใช้ดึงจาก S3")
+
+    csv_path = pull_csv_via_lambda(
+        func_url, secret=secret, s3_key=args.s3_key, prefix=args.prefix, latest=args.latest,
+        auth_mode=args.auth, region=args.region, debug=args.debug_pull, retries=3
+    )
 
 # ---------- Load CSV ----------
-df = pd.read_csv(args.csv, encoding="utf-8-sig")
+df = pd.read_csv(csv_path, encoding="utf-8-sig")
 
 col_product  = pick_first_existing(df, ["Product", "product", "ชื่อสินค้า"])
 col_price    = pick_first_existing(df, ["Price", "price", "ราคา"])
@@ -105,11 +243,12 @@ for i, r in work_limited.iterrows():
         "location": (str(r["_location"]) if pd.notna(r["_location"]) else "")
     })
 
-# ---------- Gemini config ----------
-api_key = os.environ.get("GOOGLE_API_KEY")
+# ---------- Gemini ----------
+api_key = os.environ.get("GOOGLE_API_KEY") or API_KEY_DEFAULT
 if not api_key:
-    raise SystemExit("ไม่พบ GOOGLE_API_KEY ใน environment variable — โปรดตั้งค่าก่อนใช้งาน")
+    raise SystemExit("ไม่พบ GOOGLE_API_KEY และ API_KEY_DEFAULT ว่าง — โปรดตั้งค่าก่อนใช้งาน")
 genai.configure(api_key=api_key)
+
 
 model = genai.GenerativeModel(
     model_name=args.model,
@@ -122,7 +261,6 @@ model = genai.GenerativeModel(
     )
 )
 
-# ---------- Prompt ----------
 schema_text = {
     "recommended": [
         {"index": "int (index อ้างถึง items)", "reason": "string", "confidence": "float 0..1"}
@@ -152,15 +290,22 @@ prompt = (
     "ย้ำ: ตอบเฉพาะ JSON ล้วน ไม่มีข้อความอื่น"
 )
 
-# ---------- Call Gemini ----------
 try:
     resp = model.generate_content(prompt)
     content = resp.text
+    if args.debug_raw:
+        print("[DEBUG] Raw model output:\n", content)
     data = json_safely_load(content)
-except Exception as e:
-    raise SystemExit(f"Gemini error: {e}")
+except Exception:
+    # ขอให้โมเดลซ่อม JSON เป็นมาตรฐานอีกครั้ง
+    repair_prompt = (
+        "แปลงข้อความต่อไปนี้ให้เป็น JSON ที่ถูกต้องตามมาตรฐาน RFC 8259 เท่านั้น "
+        "ใช้ double quotes สำหรับ key และ string ทุกตัว ห้ามมีคอมเมนต์หรือคำบรรยายอื่นๆ นอกเหนือ JSON\n\n"
+        + (content if 'content' in locals() else '')
+    )
+    resp2 = model.generate_content(repair_prompt)
+    data = json_safely_load(resp2.text)
 
-# ---------- Build outputs ----------
 rec_rows = []
 for it in data.get("recommended", []):
     idx = int(it["index"])
